@@ -176,9 +176,3 @@ This project is provided as-is for educational purposes. Feel free to use, modif
 ## Disclaimer
 
 **Important**: While AiNux includes security measures, always be cautious when running system commands. Test in a safe environment first, and never run commands you don't understand. The authors are not responsible for any system damage.
-
----
-
-**Author**: AI Assistant  
-**Date**: September 15, 2025  
-**Version**: 1.0.0 (Prototype)
