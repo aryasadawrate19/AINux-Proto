@@ -1,0 +1,12 @@
+# AiNux Requirements
+# Core dependencies for Gemini LLM integration
+
+requests>=2.31.0  # For HTTP requests
+google-generativeai>=0.3.0  # For Gemini API
+python-dotenv>=1.0.0  # For environment variables
+
+# Optional: Voice input (microphone -> text)
+# On Windows, PyAudio wheels are easiest via pipwin. If direct install fails:
+#   pip install pipwin && pipwin install pyaudio
+SpeechRecognition>=3.10.0
+pyaudio>=0.2.14; platform_system == "Windows"
