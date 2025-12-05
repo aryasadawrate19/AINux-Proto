@@ -162,30 +162,45 @@ class GeminiLLM:
         
         prompt = f"""You are AiNux, an expert system that converts natural language to system commands for {platform}.
 
-CRITICAL INSTRUCTIONS:
-- Output ONLY the command, no explanations, quotes, or formatting
-- Use commands appropriate for {platform}
-- Never output dangerous commands (rm -rf, format, shutdown, etc.)
-- If unclear or dangerous, output: INVALID_REQUEST
+    CRITICAL INSTRUCTIONS:
+    - Output ONLY the command, no explanations, no comments, no formatting.
+    - Use commands appropriate for {platform}.
+    - Never output unsafe commands (format, dd, fdisk, shutdown, reboot, rm -rf /, etc.)
+    - If the user request is unclear, malicious, or dangerous, output exactly: INVALID_REQUEST
 
-PLATFORM-SPECIFIC COMMANDS FOR {platform}:
-{examples_text}
+    PLATFORM-SPECIFIC COMMANDS FOR {platform}:
+    {examples_text}
 
-ADVANCED EXAMPLES:
-- "show python files" -> dir *.py (Windows) / ls *.py (Linux)
-- "find large files" -> dir /s /o-s (Windows) / find . -size +100M (Linux) 
-- "processes using memory" -> tasklist /fo table (Windows) / ps aux --sort=-rss (Linux)
-- "network connections" -> netstat -an (Windows/Linux)
-- "disk space usage" -> dir /-c (Windows) / du -sh * (Linux)
-- "who is logged in" -> query user (Windows) / who (Linux)
-- "environment variables" -> set (Windows) / env (Linux)
-- "running services" -> sc query (Windows) / systemctl --type=service (Linux)
+    ADVANCED EXAMPLES:
+    - "show python files" -> dir *.py (Windows) / ls *.py (Linux)
+    - "find large files" -> dir /s /o-s (Windows) / find . -size +100M (Linux)
+    - "processes using memory" -> tasklist /fo table (Windows) / ps aux --sort=-rss (Linux)
+    - "network connections" -> netstat -an (Windows/Linux)
+    - "disk space usage" -> dir /-c (Windows) / du -sh * (Linux)
+    - "who is logged in" -> query user (Windows) / who (Linux)
+    - "environment variables" -> set (Windows) / env (Linux)
+    - "running services" -> sc query (Windows) / systemctl --type=service (Linux)
 
-TASK: Convert this natural language to a {platform} command:
-"{user_input}"
+    DELETION RULES (IMPORTANT):
+    - For deleting folders on Linux/macOS: ALWAYS use "rm -rf <folder>".
+    - For deleting files on Linux/macOS: ALWAYS use "rm <file>".
+    - Never output "rmdir" for Linux or macOS.
+    - For Windows folder deletion: ALWAYS use "rmdir /s /q <folder>".
+    - For Windows file deletion: ALWAYS use "del <file>".
+    - Never output partially destructive commands.
 
-COMMAND:"""
-        
+    EXAMPLES FOR DELETION:
+    - "delete the folder test_data" -> rm -rf test_data          (Linux/macOS)
+    - "remove directory logs" -> rm -rf logs                     (Linux/macOS)
+    - "delete file report.txt" -> rm report.txt                  (Linux/macOS)
+    - "delete folder test_data" -> rmdir /s /q test_data         (Windows)
+    - "delete file report.txt" -> del report.txt                 (Windows)
+
+    TASK: Convert this natural language to a {platform} command:
+    "{user_input}"
+
+    COMMAND:"""
+
         return prompt
     
     def _extract_command(self, llm_response: str) -> Optional[str]:
@@ -699,80 +714,95 @@ class AiNuxLLM:
         else:
             return 'uptime'
     
-    def is_command_safe(self, command: str) -> bool:
+    def is_command_safe(self, command: str) -> Union[bool, str]:
         """
-        Check if a command is safe to execute by comparing against dangerous commands.
-        
-        Args:
-            command (str): Command to check
-            
+        Check if a command is safe, confirmable, or forbidden.
+
         Returns:
-            bool: True if command is safe, False otherwise
+            True  -> fully safe
+            "confirm" -> dangerous but allowed with confirmation
+            False -> absolutely forbidden
         """
+
         command_lower = command.lower().strip()
-        
-        # Check against dangerous command patterns
-        for dangerous_cmd in self.dangerous_commands:
-            if dangerous_cmd.lower() in command_lower:
-                return False
-        
-        # Additional safety checks for common dangerous patterns
-        dangerous_patterns = [
-            r'rm\s+-rf\s+/',
-            r'del\s+/[qsf]',
-            r'format\s+[a-z]:',
-            r'fdisk',
-            r'dd\s+if=',
-            r'shutdown',
-            r'reboot',
-            r'halt',
-            r'poweroff',
+
+        # Absolutely forbidden commands (no confirmation allowed)
+        forbidden_patterns = [
+            r'rm\s+-rf\s+/',                     # rm -rf /
+            r'format(\s|$)',                     # format disk
+            r'fdisk',                            # partitioning
+            r'dd\s+if=',                         # raw disk writes
+            r':\(\)\s*\{\s*:|:&\}\s*;\s*:',    # fork bomb
+            r'shutdown(\s|$)',
+            r'reboot(\s|$)',
+            r'poweroff(\s|$)',
             r'init\s+[06]',
-            r'chmod\s+777',
-            r'chown\s+-R',
-            r'\|\s*sh',
-            r'\|\s*bash',
-            r'wget.*\|',
-            r'curl.*\|'
         ]
-        
-        for pattern in dangerous_patterns:
+
+        for pattern in forbidden_patterns:
             if re.search(pattern, command_lower):
                 return False
-        
+
+        # Dangerous but confirmable commands (Linux + Windows)
+        confirmable_patterns = [
+            r'rm\s+-rf\s+.+',            # rm -rf <folder>
+            r'rm\s+.+',                  # rm <file>
+            r'del\s+.+',                 # del file.ext
+            r'rmdir\s+/s\s+/q\s+.+',   # WINDOWS delete folder
+            r'rmdir\s+.+',               # any rmdir is dangerous
+            r'mv\s+.+',                  # move operations
+            r'chmod\s+7[0-7][0-7]',      # chmod 7xx
+            r'chown\s+-r\s+.+',
+        ]
+
+        for pattern in confirmable_patterns:
+            if re.search(pattern, command_lower):
+                return "confirm"
+
+        # Everything else is safe
         return True
     
     def execute_command(self, command: str) -> Dict[str, any]:
         """
-        Execute a system command safely using subprocess.
-        
-        Args:
-            command (str): Command to execute
-            
-        Returns:
-            Dict: Dictionary containing success status, output, and error information
+        Execute a system command safely, with confirmation for dangerous commands.
         """
-        try:
-            # Check if command is safe before execution
-            if not self.is_command_safe(command):
+
+        safety = self.is_command_safe(command)
+
+        # Fully forbidden
+        if safety is False:
+            return {
+                'success': False,
+                'output': '',
+                'error': f'Command blocked for security reasons: {command}',
+                'command': command
+            }
+
+        # Dangerous but confirmable
+        if safety == "confirm":
+            print(f"\nWARNING: This command may delete or modify important files:\n  {command}")
+            print("If you're absolutely certain, type YES.")
+            confirm = input("Confirm (YES to run): ").strip()
+
+            if confirm.upper() != "YES":
                 return {
                     'success': False,
                     'output': '',
-                    'error': f'Command blocked for security reasons: {command}',
+                    'error': f'Execution cancelled by user: {command}',
                     'command': command
                 }
-            
-            # Use shell=True for Windows compatibility with built-in commands
-            # Set timeout to prevent hanging processes
+
+        # Safe or confirmed — run it
+        try:
             result = subprocess.run(
                 command,
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=30,  # 30 second timeout
+                timeout=30,
                 cwd=os.getcwd()
             )
-            
+
             return {
                 'success': result.returncode == 0,
                 'output': result.stdout.strip() if result.stdout else '',
@@ -780,7 +810,7 @@ class AiNuxLLM:
                 'command': command,
                 'return_code': result.returncode
             }
-            
+
         except subprocess.TimeoutExpired:
             return {
                 'success': False,
@@ -788,13 +818,7 @@ class AiNuxLLM:
                 'error': f'Command timed out after 30 seconds: {command}',
                 'command': command
             }
-        except subprocess.CalledProcessError as e:
-            return {
-                'success': False,
-                'output': e.stdout.strip() if e.stdout else '',
-                'error': f'Command failed with return code {e.returncode}: {e.stderr.strip() if e.stderr else ""}',
-                'command': command
-            }
+
         except Exception as e:
             return {
                 'success': False,
@@ -828,75 +852,86 @@ class AiNuxLLM:
         
         print("=" * 50)
     
-    def run_interactive_mode(self) -> None:
+    def run_interactive_mode(self, voice: bool = False) -> None:
         """
-        Run AiNux in interactive mode with enhanced LLM capabilities
+        Run AiNux in interactive mode with optional voice input.
         """
+
         mode_str = "LLM Enhanced" if (self.use_llm and self.llm and self.llm.available) else "Regex Fallback"
-        
         print(f"\n{mode_str} AiNux is ready! Enter natural language commands.")
-        print("\nEnhanced Examples (works better with LLM):")
-        print("  - 'Show me all Python files in this directory'")
-        print("  - 'Find all running processes containing chrome'")
-        print("  - 'Create a new folder called my_project'")
-        print("  - 'What is my current working directory?'")
-        print("  - 'Display network configuration details'")
-        print("  - 'List all files modified today'")
-        print("\nClassic Examples:")
-        print("  - 'List all files in the current directory'")
-        print("  - 'Show current working directory'")
-        print("  - 'Show running processes'")
-        print("\n")
-        
+        print("(Say 'exit' or 'quit' to stop if in voice mode.)\n")
+
+        # Try importing voice system early
+        voice_available = False
+        if voice:
+            try:
+                from voice_input import listen_for_command, VoiceInputError
+                voice_available = True
+                print("Voice mode enabled. Listening for commands...")
+            except Exception as e:
+                print(f"Voice mode failed to initialize: {e}")
+                voice = False
+
         while True:
             try:
-                # Get user input
-                user_input = input("AiNux> ").strip()
-                
-                # Check for exit commands
+                # Voice input mode
+                if voice and voice_available:
+                    from voice_input import listen_for_command
+                    print("🎤 Listening...")
+                    heard = listen_for_command(timeout=6, phrase_time_limit=8, language="en-US")
+                    user_input = (heard or "").strip()
+
+                    if not user_input:
+                        continue
+
+                    print(f"You said: {user_input}")
+
+                # Text input mode
+                else:
+                    user_input = input("AiNux> ").strip()
+
+                # Exit commands
                 if user_input.lower() in ['exit', 'quit', 'q', 'bye']:
-                    print("Goodbye! Thanks for using AiNux LLM Enhanced.")
+                    print("Goodbye! Thanks for using AiNux.")
                     break
-                
-                # Skip empty input
+
                 if not user_input:
                     continue
-                
-                # Show help if requested
+
+                # Help commands
                 if user_input.lower() in ['help', 'h', '?']:
                     self.show_help()
                     continue
-                
-                # Show mode info
+
                 if user_input.lower() in ['mode', 'info', 'status']:
                     self.show_mode_info()
                     continue
-                
-                # Parse natural language input to command
+
+                # Process natural language
                 print("Processing natural language input...")
                 command = self.parse_natural_language(user_input)
-                
+
                 if command is None:
                     print(f"Sorry, I don't understand: '{user_input}'")
-                    print("Type 'help' for examples of supported commands.")
+                    print("Type 'help' for supported commands.")
                     continue
-                
-                # Show the generated command to the user
+
                 parsing_mode = "LLM" if (self.use_llm and self.llm and self.llm.available) else "Regex"
                 print(f"Generated command ({parsing_mode}): {command}")
-                
-                # Execute the command
+
+                # Execute it
                 result = self.execute_command(command)
-                
-                # Display the result
+
+                # Display result
                 self.display_result(result)
-                
+
             except KeyboardInterrupt:
-                print("\n\n Interrupted by user. Goodbye!")
+                print("\nInterrupted by user. Exiting.")
                 break
+
             except Exception as e:
-                print(f"\n Unexpected error: {str(e)}")
-                print("Please try again or type 'exit' to quit.")
+                print(f"Unexpected error: {e}")
+                continue
     
     def show_help(self) -> None:
         """Display comprehensive help information."""
@@ -965,16 +1000,21 @@ class AiNuxLLM:
 
 if __name__ == "__main__":
     try:
-        # Initialize AiNux with LLM support
+        import argparse
+        
+        parser = argparse.ArgumentParser(description="AiNux LLM Enhanced Shell")
+        parser.add_argument("--voice", action="store_true", help="Enable microphone voice input")
+        args = parser.parse_args()
+
         ainux = AiNuxLLM(use_llm=True)
         print("AiNux LLM Enhanced Natural Language Command Executor initialized!")
         print(f"Running on: {platform.system()}")
         print("Type 'exit' or 'quit' to stop the program.")
         print("-" * 60)
-        
-        # Start interactive mode
-        ainux.run_interactive_mode()
-        
+
+        # Start interactive mode (voice-enabled)
+        ainux.run_interactive_mode(voice=args.voice)
+
     except Exception as e:
         print(f"Fatal error initializing AiNux: {str(e)}")
         sys.exit(1)

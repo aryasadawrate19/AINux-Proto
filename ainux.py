@@ -2,8 +2,6 @@
 """
 AiNux: Natural Language to System Command Executor
 A prototype system that converts natural language input into system commands.
-
-Author: AI Assistant
 Date: September 15, 2025
 """
 
@@ -192,66 +190,91 @@ class AiNux:
         # If no pattern matches, return None
         return None
     
-    def is_command_safe(self, command: str) -> bool:
+    def is_command_safe(self, command: str) -> str:
         """
-        Check if a command is safe to execute by comparing against dangerous commands.
+        Check command safety.
         
-        Args:
-            command (str): Command to check
-            
         Returns:
-            bool: True if command is safe, False otherwise
+            "safe"      -> always allowed
+            "confirm"   -> dangerous but allowed with user confirmation
+            "forbidden" -> absolutely blocked
         """
+
         command_lower = command.lower().strip()
-        
-        # Check against dangerous command patterns
-        for dangerous_cmd in self.dangerous_commands:
-            if dangerous_cmd.lower() in command_lower:
-                return False
-        
-        # Additional safety checks
-        dangerous_keywords = [
-            'format', 'fdisk', 'mkfs', 'dd if=', 'rm -rf /',
-            'del /q /s', '>nul', '/dev/null', 'shutdown', 'reboot'
+
+        # Absolutely forbidden commands
+        forbidden_patterns = [
+            r'rm\s+-rf\s+/',                     # rm -rf /
+            r'format(\s|$)',                     # format disk
+            r'fdisk',                            # partition tool
+            r'dd\s+if=',                         # raw disk overwrite
+            r'shutdown(\s|$)',
+            r'reboot(\s|$)',
+            r'poweroff(\s|$)',
+            r'init\s+[06]',                      # init 0 or 6
         ]
-        
-        for keyword in dangerous_keywords:
-            if keyword.lower() in command_lower:
-                return False
-        
-        return True
+
+        for pattern in forbidden_patterns:
+            if re.search(pattern, command_lower):
+                return "forbidden"
+
+        # Dangerous but confirmable
+        confirmable_patterns = [
+            r'rm\s+-rf\s+.+',            # rm -rf folder
+            r'rm\s+.+',                  # rm file
+            r'del\s+.+',                 # delete file (Windows)
+            r'rmdir\s+/s\s+/q\s+.+',     # delete folder (Windows)
+            r'rmdir\s+.+',               # any rmdir
+            r'mv\s+.+',                  # moving files can be destructive
+            r'chmod\s+7[0-7][0-7]',      # chmod 7xx
+            r'chown\s+-r\s+.+',          # recursive ownership
+        ]
+
+        for pattern in confirmable_patterns:
+            if re.search(pattern, command_lower):
+                return "confirm"
+
+        return "safe"
     
     def execute_command(self, command: str) -> Dict[str, any]:
         """
-        Execute a system command safely using subprocess.
-        
-        Args:
-            command (str): Command to execute
-            
-        Returns:
-            Dict: Dictionary containing success status, output, and error information
+        Execute a system command safely, with confirmation prompts.
         """
-        try:
-            # Check if command is safe before execution
-            if not self.is_command_safe(command):
+
+        safety = self.is_command_safe(command)
+
+        # Fully forbidden
+        if safety == "forbidden":
+            return {
+                'success': False,
+                'output': '',
+                'error': f'Command blocked for safety reasons: {command}',
+                'command': command
+            }
+
+        # Dangerous but confirmable
+        if safety == "confirm":
+            print(f"\nWARNING: This command may delete or modify important files:\n  {command}")
+            confirm = input("Type YES to proceed: ").strip()
+            if confirm.upper() != "YES":
                 return {
                     'success': False,
                     'output': '',
-                    'error': f'Command blocked for security reasons: {command}',
+                    'error': f'Execution cancelled by user: {command}',
                     'command': command
                 }
-            
-            # Use shell=True for Windows compatibility with built-in commands
-            # Set timeout to prevent hanging processes
+
+        # Safe or confirmed → execute
+        try:
             result = subprocess.run(
                 command,
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=30,  # 30 second timeout
+                timeout=30,
                 cwd=os.getcwd()
             )
-            
+
             return {
                 'success': result.returncode == 0,
                 'output': result.stdout.strip() if result.stdout else '',
@@ -259,7 +282,7 @@ class AiNux:
                 'command': command,
                 'return_code': result.returncode
             }
-            
+
         except subprocess.TimeoutExpired:
             return {
                 'success': False,
@@ -267,13 +290,7 @@ class AiNux:
                 'error': f'Command timed out after 30 seconds: {command}',
                 'command': command
             }
-        except subprocess.CalledProcessError as e:
-            return {
-                'success': False,
-                'output': e.stdout.strip() if e.stdout else '',
-                'error': f'Command failed with return code {e.returncode}: {e.stderr.strip() if e.stderr else ""}',
-                'command': command
-            }
+
         except Exception as e:
             return {
                 'success': False,
