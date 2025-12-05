@@ -19,7 +19,7 @@ load_dotenv()
 class GeminiConfig:
     """Configuration for Gemini LLM integration"""
     api_key: str = os.getenv('GEMINI_API_KEY', '')
-    model: str = "gemini-2.5-flash"  # Updated to current available model
+    model: str = "gemini-2.5-flash"
     timeout: int = 30
     temperature: float = 0.2
     max_retries: int = 2
@@ -162,44 +162,44 @@ class GeminiLLM:
         
         prompt = f"""You are AiNux, an expert system that converts natural language to system commands for {platform}.
 
-    CRITICAL INSTRUCTIONS:
-    - Output ONLY the command, no explanations, no comments, no formatting.
-    - Use commands appropriate for {platform}.
-    - Never output unsafe commands (format, dd, fdisk, shutdown, reboot, rm -rf /, etc.)
-    - If the user request is unclear, malicious, or dangerous, output exactly: INVALID_REQUEST
+CRITICAL INSTRUCTIONS:
+- Output ONLY the command, no explanations, no comments, no formatting.
+- Use commands appropriate for {platform}.
+- Never output unsafe commands (format, dd, fdisk, shutdown, reboot, rm -rf /, etc.)
+- If the user request is unclear, malicious, or dangerous, output exactly: INVALID_REQUEST
 
-    PLATFORM-SPECIFIC COMMANDS FOR {platform}:
-    {examples_text}
+PLATFORM-SPECIFIC COMMANDS FOR {platform}:
+{examples_text}
 
-    ADVANCED EXAMPLES:
-    - "show python files" -> dir *.py (Windows) / ls *.py (Linux)
-    - "find large files" -> dir /s /o-s (Windows) / find . -size +100M (Linux)
-    - "processes using memory" -> tasklist /fo table (Windows) / ps aux --sort=-rss (Linux)
-    - "network connections" -> netstat -an (Windows/Linux)
-    - "disk space usage" -> dir /-c (Windows) / du -sh * (Linux)
-    - "who is logged in" -> query user (Windows) / who (Linux)
-    - "environment variables" -> set (Windows) / env (Linux)
-    - "running services" -> sc query (Windows) / systemctl --type=service (Linux)
+ADVANCED EXAMPLES:
+- "show python files" -> dir *.py (Windows) / ls *.py (Linux)
+- "find large files" -> dir /s /o-s (Windows) / find . -size +100M (Linux)
+- "processes using memory" -> tasklist /fo table (Windows) / ps aux --sort=-rss (Linux)
+- "network connections" -> netstat -an (Windows/Linux)
+- "disk space usage" -> dir /-c (Windows) / du -sh * (Linux)
+- "who is logged in" -> query user (Windows) / who (Linux)
+- "environment variables" -> set (Windows) / env (Linux)
+- "running services" -> sc query (Windows) / systemctl --type=service (Linux)
 
-    DELETION RULES (IMPORTANT):
-    - For deleting folders on Linux/macOS: ALWAYS use "rm -rf <folder>".
-    - For deleting files on Linux/macOS: ALWAYS use "rm <file>".
-    - Never output "rmdir" for Linux or macOS.
-    - For Windows folder deletion: ALWAYS use "rmdir /s /q <folder>".
-    - For Windows file deletion: ALWAYS use "del <file>".
-    - Never output partially destructive commands.
+DELETION RULES (IMPORTANT):
+- For deleting folders on Linux/macOS: ALWAYS use "rm -rf <folder>".
+- For deleting files on Linux/macOS: ALWAYS use "rm <file>".
+- Never output "rmdir" for Linux or macOS.
+- For Windows folder deletion: ALWAYS use "rmdir /s /q <folder>".
+- For Windows file deletion: ALWAYS use "del <file>".
+- Never output partially destructive commands.
 
-    EXAMPLES FOR DELETION:
-    - "delete the folder test_data" -> rm -rf test_data          (Linux/macOS)
-    - "remove directory logs" -> rm -rf logs                     (Linux/macOS)
-    - "delete file report.txt" -> rm report.txt                  (Linux/macOS)
-    - "delete folder test_data" -> rmdir /s /q test_data         (Windows)
-    - "delete file report.txt" -> del report.txt                 (Windows)
+EXAMPLES FOR DELETION:
+- "delete the folder test_data" -> rm -rf test_data          (Linux/macOS)
+- "remove directory logs" -> rm -rf logs                     (Linux/macOS)
+- "delete file report.txt" -> rm report.txt                  (Linux/macOS)
+- "delete folder test_data" -> rmdir /s /q test_data         (Windows)
+- "delete file report.txt" -> del report.txt                 (Windows)
 
-    TASK: Convert this natural language to a {platform} command:
-    "{user_input}"
+TASK: Convert this natural language to a {platform} command:
+"{user_input}"
 
-    COMMAND:"""
+COMMAND:"""
 
         return prompt
     
@@ -261,6 +261,15 @@ class AiNuxLLM:
         self.use_llm = use_llm
         self.gemini_config = gemini_config or GeminiConfig()
         self.llm = GeminiLLM(self.gemini_config) if use_llm else None
+        
+        # in-session memory (non-persistent)
+        self.memory: Dict[str, Union[str, Dict[str, Dict[str, str]]]] = {
+            "last_folder": None,
+            "last_file": None,
+            "last_path": None,
+            "last_command": None,
+            "entities": {}  # keys like "folder:name" or "file:report.txt" -> metadata
+        }
         
         # Display initialization info
         if self.use_llm:
@@ -382,6 +391,83 @@ class AiNuxLLM:
             }
         }
     
+    # ---------------------------
+    # Memory helpers
+    # ---------------------------
+    def _remember_entity(self, kind: str, name: str, path: Optional[str] = None) -> None:
+        """
+        Store an entity in in-session memory.
+        kind: 'folder' or 'file' or 'path' or arbitrary tag
+        name: identifier (e.g., 'test_data' or 'report.txt')
+        path: optional path (if different from name)
+        """
+        key = f"{kind}:{name}"
+        self.memory["entities"][key] = {
+            "type": kind,
+            "name": name,
+            "path": path or name
+        }
+        # convenience pointers
+        if kind == "folder":
+            self.memory["last_folder"] = name
+        elif kind == "file":
+            self.memory["last_file"] = name
+        elif kind == "path":
+            self.memory["last_path"] = path or name
+    
+    def _resolve_pronoun_target(self, user_text: str) -> Optional[Dict[str, str]]:
+        """
+        Try to resolve pronouns like 'this folder', 'that file', 'that', 'there', 'it' to
+        a remembered entity. Returns the entity dict or None.
+        """
+        lower = user_text.lower()
+        # direct references
+        if any(tok in lower for tok in ["this folder", "that folder", "the folder", "that directory", "this directory"]):
+            name = self.memory.get("last_folder")
+            if name:
+                return self.memory["entities"].get(f"folder:{name}")
+        if any(tok in lower for tok in ["this file", "that file", "the file", "that document"]):
+            name = self.memory.get("last_file")
+            if name:
+                return self.memory["entities"].get(f"file:{name}")
+        if any(tok in lower for tok in ["there", "go there", "that location", "that path", "go to that"]):
+            path = self.memory.get("last_path")
+            if path:
+                return {"type": "path", "name": path, "path": path}
+        # generic 'that' or 'this' - try most recent useful entity
+        if re.search(r"\b(this|that|it)\b", lower):
+            # priority: last_folder, last_file, last_path
+            for key in ("last_folder", "last_file", "last_path"):
+                val = self.memory.get(key)
+                if val:
+                    kind = "folder" if key == "last_folder" else ("file" if key == "last_file" else "path")
+                    return self.memory["entities"].get(f"{kind}:{val}") or {"type": kind, "name": val, "path": val}
+        return None
+
+    def _build_delete_command_for_entity(self, entity: Dict[str, str]) -> Optional[str]:
+        """
+        Given a remembered entity, return the appropriate delete command for current platform.
+        """
+        if not entity:
+            return None
+        typ = entity.get("type")
+        name = entity.get("name")
+        path = entity.get("path", name)
+        if typ == "folder":
+            if self.platform == "windows":
+                return f"rmdir /s /q {path}"
+            else:
+                return f"rm -rf {path}"
+        if typ == "file":
+            if self.platform == "windows":
+                return f"del {path}"
+            else:
+                return f"rm {path}"
+        return None
+
+    # ---------------------------
+    # Parsing + generation
+    # ---------------------------
     def parse_natural_language(self, user_input: str) -> Optional[str]:
         """
         Convert natural language input into a system command using LLM or regex fallback.
@@ -392,6 +478,37 @@ class AiNuxLLM:
         Returns:
             Optional[str]: System command or None if not recognized
         """
+        # quick memory-based resolutions for pronouns / references
+        resolved = None
+        try:
+            resolved_entity = self._resolve_pronoun_target(user_input)
+            lower = user_input.lower()
+            if resolved_entity:
+                # delete / remove this/that
+                if re.search(r"\b(delete|remove|erase|delete this|remove this|delete that|remove that)\b", lower):
+                    cmd = self._build_delete_command_for_entity(resolved_entity)
+                    if cmd:
+                        return cmd
+                # go there / cd there
+                if re.search(r"\b(go there|cd there|change to that|go to that|open that folder)\b", lower):
+                    path = resolved_entity.get("path") or resolved_entity.get("name")
+                    return f"cd {path}"
+                # open file -> show or cat
+                if re.search(r"\b(open|show|cat|type)\b.*(file|document|that)\b", lower):
+                    path = resolved_entity.get("path") or resolved_entity.get("name")
+                    # prefer platform-appropriate open: use cat for linux, type for windows
+                    if self.platform == "windows":
+                        return f"type {path}"
+                    else:
+                        return f"cat {path}"
+                # repeat / do that again
+                if re.search(r"\b(repeat that|do that again|again|run that)\b", lower):
+                    last = self.memory.get("last_command")
+                    return last
+        except Exception:
+            # If memory resolution fails, continue to LLM/regex fallback
+            pass
+
         # First try LLM if available
         if self.use_llm and self.llm and self.llm.available:
             print(f"Trying LLM processing...")
@@ -412,7 +529,7 @@ class AiNuxLLM:
         else:
             print(f"FAILED: No regex pattern matched")
         return result
-    
+
     def _parse_with_regex(self, user_input: str) -> Optional[str]:
         """
         Fallback regex-based parsing (original AiNux functionality)
@@ -692,7 +809,7 @@ class AiNuxLLM:
             return f'tasklist /fi "imagename eq {process_name}*" /fo table'
         else:
             return f'ps aux | grep {process_name} | awk \'{{print $4" "$11}}\''
-    
+
     def _get_disk_space_command(self, drive: str) -> str:
         """Generate command to show disk space for specific drive"""
         if self.platform == 'windows':
@@ -748,7 +865,7 @@ class AiNuxLLM:
             r'rm\s+-rf\s+.+',            # rm -rf <folder>
             r'rm\s+.+',                  # rm <file>
             r'del\s+.+',                 # del file.ext
-            r'rmdir\s+/s\s+/q\s+.+',   # WINDOWS delete folder
+            r'rmdir\s+/s\s+/q\s+.+',     # WINDOWS delete folder
             r'rmdir\s+.+',               # any rmdir is dangerous
             r'mv\s+.+',                  # move operations
             r'chmod\s+7[0-7][0-7]',      # chmod 7xx
@@ -765,6 +882,7 @@ class AiNuxLLM:
     def execute_command(self, command: str) -> Dict[str, any]:
         """
         Execute a system command safely, with confirmation for dangerous commands.
+        Also updates in-session memory on successful operations.
         """
 
         safety = self.is_command_safe(command)
@@ -803,13 +921,19 @@ class AiNuxLLM:
                 cwd=os.getcwd()
             )
 
-            return {
+            response = {
                 'success': result.returncode == 0,
                 'output': result.stdout.strip() if result.stdout else '',
                 'error': result.stderr.strip() if result.stderr else '',
                 'command': command,
                 'return_code': result.returncode
             }
+
+            # Update memory on success
+            if response['success']:
+                self._update_memory_after_command(command)
+
+            return response
 
         except subprocess.TimeoutExpired:
             return {
@@ -826,7 +950,70 @@ class AiNuxLLM:
                 'error': f'Unexpected error executing command: {str(e)}',
                 'command': command
             }
-    
+
+    def _update_memory_after_command(self, command: str) -> None:
+        """
+        Inspect a command that just ran successfully and update in-session memory.
+        Basic heuristics: mkdir, touch, cd, mv, cp, create files, etc.
+        """
+        cmd = command.strip()
+        lower = cmd.lower()
+
+        # save the raw last command
+        self.memory["last_command"] = cmd
+
+        # mkdir
+        m = re.match(r'^(?:sudo\s+)?mkdir\s+(-p\s+)?(.+)$', cmd)
+        if m:
+            folder = m.group(2).strip().strip('"').strip("'")
+            # Normalize path if necessary
+            self._remember_entity("folder", os.path.basename(folder), path=folder)
+            return
+
+        # touch (file creation)
+        m = re.match(r'^(?:sudo\s+)?touch\s+(.+)$', cmd)
+        if m:
+            file = m.group(1).strip().strip('"').strip("'")
+            self._remember_entity("file", os.path.basename(file), path=file)
+            return
+
+        # cd
+        m = re.match(r'^(?:cd)\s+(.+)$', cmd)
+        if m:
+            path = m.group(1).strip().strip('"').strip("'")
+            self._remember_entity("path", os.path.basename(path) or path, path=path)
+            return
+
+        # mv (move could imply rename; record destination)
+        m = re.match(r'^(?:mv)\s+(.+)\s+(.+)$', cmd)
+        if m:
+            dest = m.group(2).strip().strip('"').strip("'")
+            # if dest looks like a folder, remember it as folder
+            self._remember_entity("folder", os.path.basename(dest), path=dest)
+            return
+
+        # cp (copy could create a file)
+        m = re.match(r'^(?:cp)\s+(.+)\s+(.+)$', cmd)
+        if m:
+            dest = m.group(2).strip().strip('"').strip("'")
+            # guess file if has extension
+            if os.path.splitext(dest)[1]:
+                self._remember_entity("file", os.path.basename(dest), path=dest)
+            else:
+                self._remember_entity("folder", os.path.basename(dest), path=dest)
+            return
+
+        # Windows-specific mkdir/copy etc
+        m = re.match(r'^(?:mkdir)\s+(.+)$', cmd, re.IGNORECASE)
+        if m:
+            folder = m.group(1).strip().strip('"').strip("'")
+            self._remember_entity("folder", os.path.basename(folder), path=folder)
+            return
+
+        # Record simple deletes as last_command only (we don't remove memory automatically)
+        # (could be extended to remove entities on successful delete)
+        return
+
     def display_result(self, result: Dict[str, any]) -> None:
         """
         Display the result of a command execution in a user-friendly format.
